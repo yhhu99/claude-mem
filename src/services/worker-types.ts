@@ -76,6 +76,11 @@ export interface ObservationData {
   cwd?: string;
 }
 
+export interface IsolatedPrompt {
+  prompt: string;
+  cwd?: string;
+}
+
 // ============================================================================
 // SSE Types
 // ============================================================================

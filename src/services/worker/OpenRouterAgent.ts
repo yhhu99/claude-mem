@@ -17,7 +17,7 @@ import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js
 import { USER_SETTINGS_PATH } from '../../shared/paths.js';
 import { logger } from '../../utils/logger.js';
 import { ModeManager } from '../domain/ModeManager.js';
-import type { ActiveSession, ConversationMessage } from '../worker-types.js';
+import type { ActiveSession, ConversationMessage, IsolatedPrompt } from '../worker-types.js';
 import { DatabaseManager } from './DatabaseManager.js';
 import { SessionManager } from './SessionManager.js';
 import {
@@ -282,6 +282,58 @@ export class OpenRouterAgent {
 
       logger.failure('SDK', 'OpenRouter agent error', { sessionDbId: session.sessionDbId }, error as Error);
       throw error;
+    }
+  }
+
+  async runIsolatedPrompts(
+    session: ActiveSession,
+    prompts: IsolatedPrompt[],
+    worker?: WorkerRef,
+  ): Promise<void> {
+    if (prompts.length === 0) {
+      return;
+    }
+
+    const { apiKey, model, siteUrl, appName } = this.getOpenRouterConfig();
+
+    if (!apiKey) {
+      throw new Error('OpenRouter API key not configured. Set CLAUDE_MEM_OPENROUTER_API_KEY in settings or OPENROUTER_API_KEY environment variable.');
+    }
+
+    if (!session.memorySessionId) {
+      const syntheticMemorySessionId = `openrouter-${session.contentSessionId}-${Date.now()}`;
+      session.memorySessionId = syntheticMemorySessionId;
+      this.dbManager.getSessionStore().updateMemorySessionId(session.sessionDbId, syntheticMemorySessionId);
+      logger.info('SESSION', `MEMORY_ID_GENERATED | sessionDbId=${session.sessionDbId} | provider=OpenRouter`);
+    }
+
+    const isolatedHistory: ConversationMessage[] = [];
+
+    for (const isolatedPrompt of prompts) {
+      isolatedHistory.push({ role: 'user', content: isolatedPrompt.prompt });
+      const response = await this.queryOpenRouterMultiTurn(isolatedHistory, apiKey, model, siteUrl, appName);
+      const responseContent = response.content || '';
+
+      if (responseContent) {
+        isolatedHistory.push({ role: 'assistant', content: responseContent });
+      }
+
+      const tokensUsed = response.tokensUsed || 0;
+      session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);
+      session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
+
+      await processAgentResponse(
+        responseContent,
+        session,
+        this.dbManager,
+        this.sessionManager,
+        worker,
+        tokensUsed,
+        null,
+        'OpenRouter',
+        isolatedPrompt.cwd,
+        model
+      );
     }
   }
 

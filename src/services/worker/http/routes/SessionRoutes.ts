@@ -24,6 +24,24 @@ import { USER_SETTINGS_PATH } from '../../../../shared/paths.js';
 import { getProcessBySession, ensureProcessExit } from '../../ProcessRegistry.js';
 import { getProjectContext } from '../../../../utils/project-name.js';
 import { normalizePlatformSource } from '../../../../shared/platform-source.js';
+import { ModeManager } from '../../../domain/ModeManager.js';
+import { buildReplayObservationBatchPrompt, buildSummaryPrompt } from '../../../../sdk/prompts.js';
+import type { ActiveSession, IsolatedPrompt } from '../../../worker-types.js';
+
+type NormalizedObservationPayload =
+  | {
+      status: 'normalized';
+      observation: {
+        tool_name: string;
+        tool_input: string;
+        tool_response: string;
+        cwd: string;
+      };
+    }
+  | {
+      status: 'skipped';
+      reason: 'tool_excluded' | 'session_memory_meta';
+    };
 
 export class SessionRoutes extends BaseRouteHandler {
   private completionHandler: SessionCompletionHandler;
@@ -86,6 +104,101 @@ export class SessionRoutes extends BaseRouteHandler {
 
   private shouldDeferProcessing(value: unknown): boolean {
     return value === true;
+  }
+
+  private getSkipTools(): Set<string> {
+    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    return new Set(settings.CLAUDE_MEM_SKIP_TOOLS.split(',').map(t => t.trim()).filter(Boolean));
+  }
+
+  private normalizeObservationPayload(
+    tool_name: string,
+    tool_input: unknown,
+    tool_response: unknown,
+    cwd: unknown,
+  ): NormalizedObservationPayload {
+    const skipTools = this.getSkipTools();
+    if (skipTools.has(tool_name)) {
+      logger.debug('SESSION', 'Skipping observation for tool', { tool_name });
+      return { status: 'skipped', reason: 'tool_excluded' };
+    }
+
+    const fileOperationTools = new Set(['Edit', 'Write', 'Read', 'NotebookEdit']);
+    if (fileOperationTools.has(tool_name) && tool_input && typeof tool_input === 'object') {
+      const filePath = (tool_input as Record<string, unknown>).file_path
+        || (tool_input as Record<string, unknown>).notebook_path;
+      if (typeof filePath === 'string' && filePath.includes('session-memory')) {
+        logger.debug('SESSION', 'Skipping meta-observation for session-memory file', {
+          tool_name,
+          file_path: filePath,
+        });
+        return { status: 'skipped', reason: 'session_memory_meta' };
+      }
+    }
+
+    const cleanedToolInput = tool_input !== undefined
+      ? stripMemoryTagsFromJson(JSON.stringify(tool_input))
+      : '{}';
+
+    const cleanedToolResponse = tool_response !== undefined
+      ? stripMemoryTagsFromJson(JSON.stringify(tool_response))
+      : '{}';
+
+    if (typeof cwd !== 'string' || !cwd.trim()) {
+      logger.error('SESSION', 'Missing cwd when preparing observation payload', {
+        tool_name,
+      });
+    }
+
+    return {
+      status: 'normalized',
+      observation: {
+        tool_name,
+        tool_input: cleanedToolInput,
+        tool_response: cleanedToolResponse,
+        cwd: typeof cwd === 'string' ? cwd : '',
+      },
+    };
+  }
+
+  private createDetachedSession(
+    sessionDbId: number,
+    overrides: Partial<ActiveSession> = {},
+  ): ActiveSession {
+    const dbSession = this.dbManager.getSessionById(sessionDbId);
+    return {
+      sessionDbId,
+      contentSessionId: dbSession.content_session_id,
+      memorySessionId: dbSession.memory_session_id,
+      project: dbSession.project,
+      platformSource: dbSession.platform_source,
+      userPrompt: overrides.userPrompt ?? dbSession.user_prompt,
+      pendingMessages: [],
+      abortController: new AbortController(),
+      generatorPromise: null,
+      lastPromptNumber: overrides.lastPromptNumber
+        ?? this.dbManager.getSessionStore().getPromptNumberFromUserPrompts(dbSession.content_session_id),
+      startTime: Date.now(),
+      cumulativeInputTokens: 0,
+      cumulativeOutputTokens: 0,
+      earliestPendingTimestamp: null,
+      conversationHistory: [],
+      currentProvider: null,
+      consecutiveRestarts: 0,
+      idleTimedOut: false,
+      lastGeneratorActivity: Date.now(),
+      processingMessageIds: [],
+      lastSummaryStored: overrides.lastSummaryStored ?? false,
+      ...overrides,
+    };
+  }
+
+  private async runIsolatedPrompts(
+    session: ActiveSession,
+    prompts: IsolatedPrompt[],
+  ): Promise<void> {
+    const agent = this.getActiveAgent();
+    await agent.runIsolatedPrompts(session, prompts, this.workerService);
   }
 
   private getReplayStatusSnapshot(contentSessionId: string): {
@@ -440,8 +553,10 @@ export class SessionRoutes extends BaseRouteHandler {
     app.post('/api/sessions/init', this.handleSessionInitByClaudeId.bind(this));
     app.post('/api/sessions/observations', this.handleObservationsByClaudeId.bind(this));
     app.post('/api/sessions/summarize', this.handleSummarizeByClaudeId.bind(this));
+    app.post('/api/sessions/summarize-isolated', this.handleSummarizeIsolated.bind(this));
     app.post('/api/sessions/complete', this.handleCompleteByClaudeId.bind(this));
     app.get('/api/sessions/status', this.handleStatusByClaudeId.bind(this));
+    app.post('/api/replay/materialize', this.handleReplayMaterialize.bind(this));
   }
 
   /**
@@ -633,31 +748,6 @@ export class SessionRoutes extends BaseRouteHandler {
       return this.badRequest(res, 'Missing contentSessionId');
     }
 
-    // Load skip tools from settings
-    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
-    const skipTools = new Set(settings.CLAUDE_MEM_SKIP_TOOLS.split(',').map(t => t.trim()).filter(Boolean));
-
-    // Skip low-value or meta tools
-    if (skipTools.has(tool_name)) {
-      logger.debug('SESSION', 'Skipping observation for tool', { tool_name });
-      res.json({ status: 'skipped', reason: 'tool_excluded' });
-      return;
-    }
-
-    // Skip meta-observations: file operations on session-memory files
-    const fileOperationTools = new Set(['Edit', 'Write', 'Read', 'NotebookEdit']);
-    if (fileOperationTools.has(tool_name) && tool_input) {
-      const filePath = tool_input.file_path || tool_input.notebook_path;
-      if (filePath && filePath.includes('session-memory')) {
-        logger.debug('SESSION', 'Skipping meta-observation for session-memory file', {
-          tool_name,
-          file_path: filePath
-        });
-        res.json({ status: 'skipped', reason: 'session_memory_meta' });
-        return;
-      }
-    }
-
     try {
       const store = this.dbManager.getSessionStore();
 
@@ -679,28 +769,24 @@ export class SessionRoutes extends BaseRouteHandler {
         return;
       }
 
-      // Strip memory tags from tool_input and tool_response
-      const cleanedToolInput = tool_input !== undefined
-        ? stripMemoryTagsFromJson(JSON.stringify(tool_input))
-        : '{}';
-
-      const cleanedToolResponse = tool_response !== undefined
-        ? stripMemoryTagsFromJson(JSON.stringify(tool_response))
-        : '{}';
+      const normalized = this.normalizeObservationPayload(
+        tool_name,
+        tool_input,
+        tool_response,
+        cwd,
+      );
+      if (normalized.status === 'skipped') {
+        res.json({ status: 'skipped', reason: normalized.reason });
+        return;
+      }
 
       // Queue observation
       this.sessionManager.queueObservation(sessionDbId, {
-        tool_name,
-        tool_input: cleanedToolInput,
-        tool_response: cleanedToolResponse,
+        tool_name: normalized.observation.tool_name,
+        tool_input: normalized.observation.tool_input,
+        tool_response: normalized.observation.tool_response,
         prompt_number: promptNumber,
-        cwd: cwd || (() => {
-          logger.error('SESSION', 'Missing cwd when queueing observation in SessionRoutes', {
-            sessionId: sessionDbId,
-            tool_name
-          });
-          return '';
-        })()
+        cwd: normalized.observation.cwd,
       });
 
       if (!deferProcessing) {
@@ -766,6 +852,236 @@ export class SessionRoutes extends BaseRouteHandler {
     this.eventBroadcaster.broadcastSummarizeQueued();
 
     res.json({ status: 'queued' });
+  });
+
+  /**
+   * Run a summary extraction pass in isolation for the latest prompt.
+   * POST /api/sessions/summarize-isolated
+   * Body: { contentSessionId, last_assistant_message }
+   */
+  private handleSummarizeIsolated = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
+    const { contentSessionId, last_assistant_message } = req.body;
+    const platformSource = normalizePlatformSource(req.body.platformSource);
+
+    if (!contentSessionId) {
+      return this.badRequest(res, 'Missing contentSessionId');
+    }
+
+    const store = this.dbManager.getSessionStore();
+    const sessionDbId = store.createSDKSession(contentSessionId, '', '', undefined, platformSource);
+    const promptNumber = store.getPromptNumberFromUserPrompts(contentSessionId);
+
+    const userPrompt = PrivacyCheckValidator.checkUserPromptPrivacy(
+      store,
+      contentSessionId,
+      promptNumber,
+      'summarize',
+      sessionDbId
+    );
+    if (!userPrompt) {
+      res.json({ status: 'skipped', reason: 'private', sessionDbId });
+      return;
+    }
+
+    if (typeof last_assistant_message !== 'string' || !last_assistant_message.trim()) {
+      const status = this.getReplayStatusSnapshot(contentSessionId);
+      res.json({
+        status: 'skipped',
+        reason: 'empty_last_assistant_message',
+        sessionDbId,
+        summaryStored: status.summaryStored === true,
+        summaryCount: status.summaryCount,
+      });
+      return;
+    }
+
+    const detachedSession = this.createDetachedSession(sessionDbId, {
+      userPrompt,
+      lastPromptNumber: promptNumber,
+      lastSummaryStored: false,
+    });
+    const mode = ModeManager.getInstance().getActiveMode();
+    const summaryPrompt = buildSummaryPrompt({
+      id: sessionDbId,
+      memory_session_id: detachedSession.memorySessionId,
+      project: detachedSession.project,
+      user_prompt: userPrompt,
+      last_assistant_message,
+    }, mode);
+
+    await this.runIsolatedPrompts(detachedSession, [{ prompt: summaryPrompt }]);
+
+    const status = this.getReplayStatusSnapshot(contentSessionId);
+    const activeSession = this.sessionManager.getSession(sessionDbId);
+    if (activeSession) {
+      activeSession.lastSummaryStored = status.summaryStored ?? false;
+    }
+
+    res.json({
+      status: 'completed',
+      sessionDbId,
+      summaryStored: status.summaryStored === true,
+      summaryCount: status.summaryCount,
+    });
+  });
+
+  /**
+   * Materialize replay observations and summary in isolated passes.
+   * POST /api/replay/materialize
+   */
+  private handleReplayMaterialize = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
+    const { contentSessionId } = req.body;
+    const project = typeof req.body.project === 'string' ? req.body.project : '';
+    const rawPrompt = typeof req.body.prompt === 'string' ? req.body.prompt : '[media prompt]';
+    const cwd = typeof req.body.cwd === 'string' && req.body.cwd.trim() ? req.body.cwd : undefined;
+    const platformSource = normalizePlatformSource(req.body.platformSource);
+    const observations = Array.isArray(req.body.observations)
+      ? req.body.observations as Array<{
+          tool_name: string;
+          tool_input: unknown;
+          tool_response: unknown;
+          cwd?: string;
+        }>
+      : [];
+    const lastAssistantMessage = typeof req.body.last_assistant_message === 'string'
+      ? req.body.last_assistant_message
+      : '';
+
+    if (!contentSessionId) {
+      return this.badRequest(res, 'Missing contentSessionId');
+    }
+
+    const strippedPrompt = stripMemoryTagsFromPrompt(rawPrompt);
+    if (!strippedPrompt.trim()) {
+      res.json({
+        status: 'skipped',
+        reason: 'private',
+        observationCount: 0,
+        summaryCount: 0,
+        observationDelta: 0,
+        summaryDelta: 0,
+        summaryStored: false,
+      });
+      return;
+    }
+
+    const cleanedPrompt = strippedPrompt || '[media prompt]';
+    const normalizedObservations = observations.flatMap((observation) => {
+      const normalized = this.normalizeObservationPayload(
+        observation.tool_name,
+        observation.tool_input,
+        observation.tool_response,
+        observation.cwd ?? cwd,
+      );
+      if (normalized.status === 'skipped') {
+        return [];
+      }
+      return [{
+        tool_name: normalized.observation.tool_name,
+        tool_input: normalized.observation.tool_input,
+        tool_response: normalized.observation.tool_response,
+        cwd: normalized.observation.cwd,
+      }];
+    });
+
+    const expectedObservationCount = normalizedObservations.length;
+    const expectsSummary = !!lastAssistantMessage.trim();
+
+    if (expectedObservationCount === 0 && !expectsSummary) {
+      res.json({
+        status: 'skipped',
+        reason: 'no_replayable_content',
+        observationCount: 0,
+        summaryCount: 0,
+        observationDelta: 0,
+        summaryDelta: 0,
+        summaryStored: false,
+      });
+      return;
+    }
+
+    const store = this.dbManager.getSessionStore();
+    let sessionDbId: number | null = null;
+
+    try {
+      sessionDbId = store.createSDKSession(contentSessionId, project, cleanedPrompt, undefined, platformSource);
+      const currentPromptCount = store.getPromptNumberFromUserPrompts(contentSessionId);
+      const promptNumber = currentPromptCount + 1;
+      store.saveUserPrompt(contentSessionId, promptNumber, cleanedPrompt);
+
+      const detachedSession = this.createDetachedSession(sessionDbId, {
+        project,
+        userPrompt: cleanedPrompt,
+        lastPromptNumber: promptNumber,
+        lastSummaryStored: false,
+      });
+
+      const beforeStatus = this.getReplayStatusSnapshot(contentSessionId);
+
+      if (expectedObservationCount > 0) {
+        const observationPrompt = buildReplayObservationBatchPrompt(
+          project,
+          cleanedPrompt,
+          normalizedObservations.map((observation) => ({
+            tool_name: observation.tool_name,
+            tool_input: observation.tool_input,
+            tool_output: observation.tool_response,
+            cwd: observation.cwd,
+          })),
+        );
+        await this.runIsolatedPrompts(detachedSession, [{
+          prompt: observationPrompt,
+          cwd,
+        }]);
+      }
+
+      const afterObservationStatus = this.getReplayStatusSnapshot(contentSessionId);
+      const observationDelta = afterObservationStatus.observationCount - beforeStatus.observationCount;
+
+      if (expectsSummary) {
+        const mode = ModeManager.getInstance().getActiveMode();
+        detachedSession.lastSummaryStored = false;
+        const summaryPrompt = buildSummaryPrompt({
+          id: sessionDbId,
+          memory_session_id: detachedSession.memorySessionId,
+          project,
+          user_prompt: cleanedPrompt,
+          last_assistant_message: lastAssistantMessage,
+        }, mode);
+        await this.runIsolatedPrompts(detachedSession, [{
+          prompt: summaryPrompt,
+          cwd,
+        }]);
+      }
+
+      const afterSummaryStatus = this.getReplayStatusSnapshot(contentSessionId);
+      const summaryDelta = afterSummaryStatus.summaryCount - afterObservationStatus.summaryCount;
+
+      if (expectedObservationCount > 0 && observationDelta <= 0) {
+        throw new Error(`Replay materialization stored zero observations for ${contentSessionId}`);
+      }
+      if (expectsSummary && summaryDelta <= 0) {
+        throw new Error(`Replay materialization stored zero summaries for ${contentSessionId}`);
+      }
+
+      await this.completionHandler.completeByDbId(sessionDbId);
+
+      res.json({
+        status: 'completed',
+        sessionDbId,
+        observationCount: afterSummaryStatus.observationCount,
+        summaryCount: afterSummaryStatus.summaryCount,
+        observationDelta,
+        summaryDelta,
+        summaryStored: afterSummaryStatus.summaryStored === true,
+      });
+    } catch (error) {
+      if (sessionDbId !== null) {
+        store.markSessionFailed(sessionDbId);
+        this.sessionManager.removeSessionImmediate(sessionDbId);
+      }
+      throw error;
+    }
   });
 
   /**

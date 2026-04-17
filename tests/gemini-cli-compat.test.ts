@@ -232,6 +232,6 @@ describe('Summarize handler - platformSource in request body', () => {
     // The body must include platformSource
     expect(src).toContain('platformSource');
     // It must appear in the JSON.stringify call for the summarize endpoint
-    expect(src).toContain('/api/sessions/summarize');
+    expect(src).toContain('/api/sessions/summarize-isolated');
   });
 });

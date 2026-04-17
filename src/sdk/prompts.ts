@@ -15,6 +15,13 @@ export interface Observation {
   cwd?: string;
 }
 
+export interface ReplayObservationInput {
+  tool_name: string;
+  tool_input: unknown;
+  tool_output: unknown;
+  cwd?: string;
+}
+
 export interface SDKSession {
   id: number;
   memory_session_id: string | null;
@@ -121,6 +128,65 @@ export function buildObservationPrompt(obs: Observation): string {
 Return either one or more <observation>...</observation> blocks, or an empty response if this tool use should be skipped.
 Concrete debugging findings from logs, queue state, database rows, session routing, or code-path inspection count as durable discoveries and should be recorded.
 Never reply with prose such as "Skipping", "No substantive tool executions", or any explanation outside XML. Non-XML text is discarded.`;
+}
+
+/**
+ * Build a replay-only observation extraction prompt over a full batch
+ */
+export function buildReplayObservationBatchPrompt(
+  project: string,
+  userPrompt: string,
+  observations: ReplayObservationInput[],
+): string {
+  const replayEvents = observations.map((observation, index) => {
+    let toolInput: unknown;
+    let toolOutput: unknown;
+
+    try {
+      toolInput = typeof observation.tool_input === 'string'
+        ? JSON.parse(observation.tool_input)
+        : observation.tool_input;
+    } catch (error) {
+      logger.debug('SDK', 'Replay tool input is plain string, using as-is', {
+        toolName: observation.tool_name,
+      }, error as Error);
+      toolInput = observation.tool_input;
+    }
+
+    try {
+      toolOutput = typeof observation.tool_output === 'string'
+        ? JSON.parse(observation.tool_output)
+        : observation.tool_output;
+    } catch (error) {
+      logger.debug('SDK', 'Replay tool output is plain string, using as-is', {
+        toolName: observation.tool_name,
+      }, error as Error);
+      toolOutput = observation.tool_output;
+    }
+
+    const workingDirectory = observation.cwd
+      ? `\n    <working_directory>${observation.cwd}</working_directory>`
+      : '';
+    return `  <event index="${index + 1}">
+    <tool_name>${observation.tool_name}</tool_name>${workingDirectory}
+    <tool_input>${JSON.stringify(toolInput, null, 2)}</tool_input>
+    <tool_output>${JSON.stringify(toolOutput, null, 2)}</tool_output>
+  </event>`;
+  }).join('\n');
+
+  return `--- REPLAY MATERIALIZATION: OBSERVATION EXTRACTION ---
+Do NOT output <summary> tags. This is an observation extraction request over replayed tool events.
+Return one or more <observation>...</observation> blocks, or an empty response if nothing should be stored.
+Never reply with prose such as "Skipping" or "No observations to record yet". Non-XML text is discarded.
+
+<replay_context>
+  <project>${project}</project>
+  <user_request>${userPrompt}</user_request>
+</replay_context>
+
+<replayed_primary_session_tool_events>
+${replayEvents}
+</replayed_primary_session_tool_events>`;
 }
 
 /**

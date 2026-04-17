@@ -53,6 +53,7 @@ describe('SessionRoutes replay controls', () => {
   let countObservationsByMemorySessionId: ReturnType<typeof mock>;
   let countSummariesByMemorySessionId: ReturnType<typeof mock>;
   let hasSummaryForPrompt: ReturnType<typeof mock>;
+  let markSessionFailed: ReturnType<typeof mock>;
 
   let ensureGeneratorRunning: ReturnType<typeof mock>;
   let routes: SessionRoutes;
@@ -96,6 +97,7 @@ describe('SessionRoutes replay controls', () => {
     countObservationsByMemorySessionId = mock(() => 0);
     countSummariesByMemorySessionId = mock(() => 0);
     hasSummaryForPrompt = mock(() => false);
+    markSessionFailed = mock(() => {});
 
     const sessionManager = {
       getSession,
@@ -115,6 +117,7 @@ describe('SessionRoutes replay controls', () => {
       countObservationsByMemorySessionId,
       countSummariesByMemorySessionId,
       hasSummaryForPrompt,
+      markSessionFailed,
     };
     const dbManager = {
       getSessionStore: () => sessionStore,
@@ -330,5 +333,308 @@ describe('SessionRoutes replay controls', () => {
         summaryStored: false,
       }),
     );
+  });
+
+  it('runs summarize-isolated without touching the queued summarize path', async () => {
+    getSession.mockReturnValue(undefined);
+    getSessionByContentSessionId.mockReturnValue({
+      id: 7,
+      content_session_id: 'content-1',
+      memory_session_id: 'memory-1',
+      project: 'testbed',
+      status: 'active',
+      started_at_epoch: 1000,
+    });
+    getSessionById.mockReturnValue({
+      id: 7,
+      content_session_id: 'content-1',
+      memory_session_id: 'memory-1',
+      project: 'testbed',
+      platform_source: 'claude',
+      user_prompt: 'Fix the test',
+      started_at_epoch: 1000,
+    });
+    getPromptNumberFromUserPrompts.mockReturnValue(1);
+    getLatestUserPrompt.mockReturnValue({ prompt_number: 1 });
+    countSummariesByMemorySessionId.mockReturnValue(1);
+    hasSummaryForPrompt.mockReturnValue(true);
+    const runIsolatedPrompts = mock(async () => {});
+    (routes as any).runIsolatedPrompts = runIsolatedPrompts;
+
+    const { req, res, jsonSpy } = createMockReqRes({
+      body: {
+        contentSessionId: 'content-1',
+        last_assistant_message: 'I fixed the failing branch.',
+      },
+    });
+
+    await handlers['POST /api/sessions/summarize-isolated'](req as Request, res as Response);
+
+    expect(queueSummarize).not.toHaveBeenCalled();
+    expect(runIsolatedPrompts).toHaveBeenCalledTimes(1);
+    expect(runIsolatedPrompts.mock.calls[0]?.[1]?.[0]?.prompt).toContain('<summary>');
+    expect(jsonSpy).toHaveBeenCalledWith({
+      status: 'completed',
+      sessionDbId: 7,
+      summaryStored: true,
+      summaryCount: 1,
+    });
+  });
+
+  it('materializes replay via isolated observation and summary passes', async () => {
+    getSession.mockReturnValue(undefined);
+    getSessionByContentSessionId.mockReturnValue({
+      id: 7,
+      content_session_id: 'replay-1',
+      memory_session_id: 'memory-1',
+      project: 'testbed',
+      status: 'active',
+      started_at_epoch: 1000,
+    });
+    getSessionById.mockReturnValue({
+      id: 7,
+      content_session_id: 'replay-1',
+      memory_session_id: 'memory-1',
+      project: 'testbed',
+      platform_source: 'claude',
+      user_prompt: 'Fix the failing test',
+      started_at_epoch: 1000,
+    });
+    getPromptNumberFromUserPrompts.mockReturnValue(0);
+    getLatestUserPrompt.mockReturnValue({ prompt_number: 1 });
+    countObservationsByMemorySessionId
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(2)
+      .mockReturnValueOnce(2);
+    countSummariesByMemorySessionId
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(1);
+    hasSummaryForPrompt
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true);
+
+    const runIsolatedPrompts = mock(async () => {});
+    const completeByDbId = mock(async () => {});
+    (routes as any).runIsolatedPrompts = runIsolatedPrompts;
+    (routes as any).completionHandler = { completeByDbId };
+
+    const { req, res, jsonSpy } = createMockReqRes({
+      body: {
+        contentSessionId: 'replay-1',
+        project: 'testbed',
+        prompt: 'Repository: owner/repo\nFix the failing test',
+        cwd: '/workspace/testbed',
+        observations: [
+          {
+            tool_name: 'read_file',
+            tool_input: { path: 'app.py' },
+            tool_response: 'contents',
+          },
+        ],
+        last_assistant_message: 'The failure is in app.py',
+      },
+    });
+
+    await handlers['POST /api/replay/materialize'](req as Request, res as Response);
+
+    expect(saveUserPrompt).toHaveBeenCalledWith(
+      'replay-1',
+      1,
+      'Repository: owner/repo\nFix the failing test',
+    );
+    expect(runIsolatedPrompts).toHaveBeenCalledTimes(2);
+    expect(runIsolatedPrompts.mock.calls[0]?.[1]?.[0]?.prompt).toContain(
+      'REPLAY MATERIALIZATION: OBSERVATION EXTRACTION',
+    );
+    expect(runIsolatedPrompts.mock.calls[1]?.[1]?.[0]?.prompt).toContain('<summary>');
+    expect(completeByDbId).toHaveBeenCalledWith(7);
+    expect(jsonSpy).toHaveBeenCalledWith({
+      status: 'completed',
+      sessionDbId: 7,
+      observationCount: 2,
+      summaryCount: 1,
+      observationDelta: 2,
+      summaryDelta: 1,
+      summaryStored: true,
+    });
+  });
+
+  it('skips replay materialization when the replay prompt is entirely private', async () => {
+    const runIsolatedPrompts = mock(async () => {});
+    (routes as any).runIsolatedPrompts = runIsolatedPrompts;
+
+    const { req, res, jsonSpy } = createMockReqRes({
+      body: {
+        contentSessionId: 'replay-private',
+        project: 'testbed',
+        prompt: '<private>secret</private>',
+        observations: [
+          {
+            tool_name: 'read_file',
+            tool_input: { path: 'app.py' },
+            tool_response: 'contents',
+            cwd: '/workspace/testbed',
+          },
+        ],
+      },
+    });
+
+    await handlers['POST /api/replay/materialize'](req as Request, res as Response);
+
+    expect(createSDKSession).not.toHaveBeenCalled();
+    expect(runIsolatedPrompts).not.toHaveBeenCalled();
+    expect(jsonSpy).toHaveBeenCalledWith({
+      status: 'skipped',
+      reason: 'private',
+      observationCount: 0,
+      summaryCount: 0,
+      observationDelta: 0,
+      summaryDelta: 0,
+      summaryStored: false,
+    });
+  });
+
+  it('skips replay materialization when all replay observations are filtered out', async () => {
+    settingsSpy.mockReturnValue({
+      CLAUDE_MEM_SKIP_TOOLS: 'read_file',
+    } as any);
+    const runIsolatedPrompts = mock(async () => {});
+    (routes as any).runIsolatedPrompts = runIsolatedPrompts;
+
+    const { req, res, jsonSpy } = createMockReqRes({
+      body: {
+        contentSessionId: 'replay-empty',
+        project: 'testbed',
+        prompt: 'Repository: owner/repo\nFix the failing test',
+        observations: [
+          {
+            tool_name: 'read_file',
+            tool_input: { path: 'app.py' },
+            tool_response: 'contents',
+            cwd: '/workspace/testbed',
+          },
+        ],
+      },
+    });
+
+    await handlers['POST /api/replay/materialize'](req as Request, res as Response);
+
+    expect(createSDKSession).not.toHaveBeenCalled();
+    expect(runIsolatedPrompts).not.toHaveBeenCalled();
+    expect(jsonSpy).toHaveBeenCalledWith({
+      status: 'skipped',
+      reason: 'no_replayable_content',
+      observationCount: 0,
+      summaryCount: 0,
+      observationDelta: 0,
+      summaryDelta: 0,
+      summaryStored: false,
+    });
+  });
+
+  it('skips session-memory meta observations during replay materialization', async () => {
+    const runIsolatedPrompts = mock(async () => {});
+    (routes as any).runIsolatedPrompts = runIsolatedPrompts;
+
+    const { req, res, jsonSpy } = createMockReqRes({
+      body: {
+        contentSessionId: 'replay-meta',
+        project: 'testbed',
+        prompt: 'Repository: owner/repo\nFix the failing test',
+        observations: [
+          {
+            tool_name: 'Edit',
+            tool_input: { file_path: '/workspace/session-memory/note.md' },
+            tool_response: 'updated',
+            cwd: '/workspace/testbed',
+          },
+        ],
+      },
+    });
+
+    await handlers['POST /api/replay/materialize'](req as Request, res as Response);
+
+    expect(createSDKSession).not.toHaveBeenCalled();
+    expect(runIsolatedPrompts).not.toHaveBeenCalled();
+    expect(jsonSpy).toHaveBeenCalledWith({
+      status: 'skipped',
+      reason: 'no_replayable_content',
+      observationCount: 0,
+      summaryCount: 0,
+      observationDelta: 0,
+      summaryDelta: 0,
+      summaryStored: false,
+    });
+  });
+
+  it('strips memory tags and preserves cwd in replay observation prompts', async () => {
+    getSession.mockReturnValue(undefined);
+    getSessionByContentSessionId.mockReturnValue({
+      id: 7,
+      content_session_id: 'replay-clean',
+      memory_session_id: 'memory-1',
+      project: 'testbed',
+      status: 'active',
+      started_at_epoch: 1000,
+    });
+    getSessionById.mockReturnValue({
+      id: 7,
+      content_session_id: 'replay-clean',
+      memory_session_id: 'memory-1',
+      project: 'testbed',
+      platform_source: 'claude',
+      user_prompt: 'Fix the failing test',
+      started_at_epoch: 1000,
+    });
+    getPromptNumberFromUserPrompts.mockReturnValue(0);
+    getLatestUserPrompt.mockReturnValue({ prompt_number: 1 });
+    countObservationsByMemorySessionId
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(1)
+      .mockReturnValueOnce(1);
+    countSummariesByMemorySessionId
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0);
+    hasSummaryForPrompt
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(false);
+
+    const runIsolatedPrompts = mock(async () => {});
+    const completeByDbId = mock(async () => {});
+    (routes as any).runIsolatedPrompts = runIsolatedPrompts;
+    (routes as any).completionHandler = { completeByDbId };
+
+    const { req, res } = createMockReqRes({
+      body: {
+        contentSessionId: 'replay-clean',
+        project: 'testbed',
+        prompt: 'Repository: owner/repo\nFix the failing test',
+        cwd: '/workspace/testbed',
+        observations: [
+          {
+            tool_name: 'read_file',
+            tool_input: {
+              path: 'app.py',
+              note: '<private>secret</private>',
+            },
+            tool_response: 'visible <private>secret</private> output',
+            cwd: '/workspace/testbed',
+          },
+        ],
+      },
+    });
+
+    await handlers['POST /api/replay/materialize'](req as Request, res as Response);
+
+    expect(runIsolatedPrompts).toHaveBeenCalledTimes(1);
+    const replayPrompt = runIsolatedPrompts.mock.calls[0]?.[1]?.[0]?.prompt as string;
+    expect(replayPrompt).toContain('<working_directory>/workspace/testbed</working_directory>');
+    expect(replayPrompt).not.toContain('<private>');
+    expect(replayPrompt).toContain('"path": "app.py"');
+    expect(completeByDbId).toHaveBeenCalledWith(7);
   });
 });
