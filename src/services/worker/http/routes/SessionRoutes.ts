@@ -1019,6 +1019,7 @@ export class SessionRoutes extends BaseRouteHandler {
       const beforeStatus = this.getReplayStatusSnapshot(contentSessionId);
 
       if (expectedObservationCount > 0) {
+        const mode = ModeManager.getInstance().getActiveMode();
         const observationPrompt = buildReplayObservationBatchPrompt(
           project,
           cleanedPrompt,
@@ -1028,6 +1029,7 @@ export class SessionRoutes extends BaseRouteHandler {
             tool_output: observation.tool_response,
             cwd: observation.cwd,
           })),
+          mode,
         );
         await this.runIsolatedPrompts(detachedSession, [{
           prompt: observationPrompt,
@@ -1056,12 +1058,22 @@ export class SessionRoutes extends BaseRouteHandler {
 
       const afterSummaryStatus = this.getReplayStatusSnapshot(contentSessionId);
       const summaryDelta = afterSummaryStatus.summaryCount - afterObservationStatus.summaryCount;
-
+      const warnings: string[] = [];
       if (expectedObservationCount > 0 && observationDelta <= 0) {
-        throw new Error(`Replay materialization stored zero observations for ${contentSessionId}`);
+        warnings.push('zero_observations');
       }
-      if (expectsSummary && summaryDelta <= 0) {
-        throw new Error(`Replay materialization stored zero summaries for ${contentSessionId}`);
+
+      let materializationMode: 'both' | 'observations_only' | 'summary_only' | null = null;
+      if (observationDelta > 0 && summaryDelta > 0) {
+        materializationMode = 'both';
+      } else if (observationDelta > 0) {
+        materializationMode = 'observations_only';
+      } else if (summaryDelta > 0) {
+        materializationMode = 'summary_only';
+      }
+
+      if (!materializationMode) {
+        throw new Error(`Replay materialization stored no observations or summaries for ${contentSessionId}`);
       }
 
       await this.completionHandler.completeByDbId(sessionDbId);
@@ -1073,6 +1085,8 @@ export class SessionRoutes extends BaseRouteHandler {
         summaryCount: afterSummaryStatus.summaryCount,
         observationDelta,
         summaryDelta,
+        materializationMode,
+        warnings,
         summaryStored: afterSummaryStatus.summaryStored === true,
       });
     } catch (error) {

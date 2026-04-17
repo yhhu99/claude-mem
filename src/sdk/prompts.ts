@@ -30,28 +30,8 @@ export interface SDKSession {
   last_assistant_message?: string;
 }
 
-/**
- * Build initial prompt to initialize the SDK agent
- */
-export function buildInitPrompt(project: string, sessionId: string, userPrompt: string, mode: ModeConfig): string {
-  return `${mode.prompts.system_identity}
-
-<observed_from_primary_session>
-  <user_request>${userPrompt}</user_request>
-  <requested_at>${new Date().toISOString().split('T')[0]}</requested_at>
-</observed_from_primary_session>
-
-${mode.prompts.observer_role}
-
-${mode.prompts.spatial_awareness}
-
-${mode.prompts.recording_focus}
-
-${mode.prompts.skip_guidance}
-
-${mode.prompts.output_format_header}
-
-\`\`\`xml
+function buildObservationXmlSchema(mode: ModeConfig): string {
+  return `\`\`\`xml
 <observation>
   <type>[ ${mode.observation_types.map(t => t.id).join(' | ')} ]</type>
   <!--
@@ -84,7 +64,31 @@ ${mode.prompts.output_format_header}
     <file>${mode.prompts.xml_file_placeholder}</file>
   </files_modified>
 </observation>
-\`\`\`
+\`\`\``;
+}
+
+/**
+ * Build initial prompt to initialize the SDK agent
+ */
+export function buildInitPrompt(project: string, sessionId: string, userPrompt: string, mode: ModeConfig): string {
+  return `${mode.prompts.system_identity}
+
+<observed_from_primary_session>
+  <user_request>${userPrompt}</user_request>
+  <requested_at>${new Date().toISOString().split('T')[0]}</requested_at>
+</observed_from_primary_session>
+
+${mode.prompts.observer_role}
+
+${mode.prompts.spatial_awareness}
+
+${mode.prompts.recording_focus}
+
+${mode.prompts.skip_guidance}
+
+${mode.prompts.output_format_header}
+
+${buildObservationXmlSchema(mode)}
 ${mode.prompts.format_examples}
 
 ${mode.prompts.footer}
@@ -137,6 +141,7 @@ export function buildReplayObservationBatchPrompt(
   project: string,
   userPrompt: string,
   observations: ReplayObservationInput[],
+  mode: ModeConfig,
 ): string {
   const replayEvents = observations.map((observation, index) => {
     let toolInput: unknown;
@@ -186,7 +191,24 @@ Never reply with prose such as "Skipping" or "No observations to record yet". No
 
 <replayed_primary_session_tool_events>
 ${replayEvents}
-</replayed_primary_session_tool_events>`;
+</replayed_primary_session_tool_events>
+
+${mode.prompts.system_identity}
+
+${mode.prompts.observer_role}
+
+${mode.prompts.spatial_awareness}
+
+${mode.prompts.recording_focus}
+
+${mode.prompts.skip_guidance}
+
+${mode.prompts.output_format_header}
+
+${buildObservationXmlSchema(mode)}
+${mode.prompts.format_examples}
+
+${mode.prompts.footer}`;
 }
 
 /**
@@ -266,40 +288,7 @@ ${mode.prompts.continuation_instruction}
 
 ${mode.prompts.output_format_header}
 
-\`\`\`xml
-<observation>
-  <type>[ ${mode.observation_types.map(t => t.id).join(' | ')} ]</type>
-  <!--
-    ${mode.prompts.type_guidance}
-  -->
-  <title>${mode.prompts.xml_title_placeholder}</title>
-  <subtitle>${mode.prompts.xml_subtitle_placeholder}</subtitle>
-  <facts>
-    <fact>${mode.prompts.xml_fact_placeholder}</fact>
-    <fact>${mode.prompts.xml_fact_placeholder}</fact>
-    <fact>${mode.prompts.xml_fact_placeholder}</fact>
-  </facts>
-  <!--
-    ${mode.prompts.field_guidance}
-  -->
-  <narrative>${mode.prompts.xml_narrative_placeholder}</narrative>
-  <concepts>
-    <concept>${mode.prompts.xml_concept_placeholder}</concept>
-    <concept>${mode.prompts.xml_concept_placeholder}</concept>
-  </concepts>
-  <!--
-    ${mode.prompts.concept_guidance}
-  -->
-  <files_read>
-    <file>${mode.prompts.xml_file_placeholder}</file>
-    <file>${mode.prompts.xml_file_placeholder}</file>
-  </files_read>
-  <files_modified>
-    <file>${mode.prompts.xml_file_placeholder}</file>
-    <file>${mode.prompts.xml_file_placeholder}</file>
-  </files_modified>
-</observation>
-\`\`\`
+${buildObservationXmlSchema(mode)}
 ${mode.prompts.format_examples}
 
 ${mode.prompts.footer}

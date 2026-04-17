@@ -457,6 +457,81 @@ describe('SessionRoutes replay controls', () => {
       summaryCount: 1,
       observationDelta: 2,
       summaryDelta: 1,
+      materializationMode: 'both',
+      warnings: [],
+      summaryStored: true,
+    });
+  });
+
+  it('allows replay to complete when only summary materializes', async () => {
+    getSession.mockReturnValue(undefined);
+    getSessionByContentSessionId.mockReturnValue({
+      id: 7,
+      content_session_id: 'replay-summary-only',
+      memory_session_id: 'memory-1',
+      project: 'testbed',
+      status: 'active',
+      started_at_epoch: 1000,
+    });
+    getSessionById.mockReturnValue({
+      id: 7,
+      content_session_id: 'replay-summary-only',
+      memory_session_id: 'memory-1',
+      project: 'testbed',
+      platform_source: 'claude',
+      user_prompt: 'Fix the failing test',
+      started_at_epoch: 1000,
+    });
+    getPromptNumberFromUserPrompts.mockReturnValue(0);
+    getLatestUserPrompt.mockReturnValue({ prompt_number: 1 });
+    countObservationsByMemorySessionId
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0);
+    countSummariesByMemorySessionId
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(1);
+    hasSummaryForPrompt
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true);
+
+    const runIsolatedPrompts = mock(async () => {});
+    const completeByDbId = mock(async () => {});
+    (routes as any).runIsolatedPrompts = runIsolatedPrompts;
+    (routes as any).completionHandler = { completeByDbId };
+
+    const { req, res, jsonSpy } = createMockReqRes({
+      body: {
+        contentSessionId: 'replay-summary-only',
+        project: 'testbed',
+        prompt: 'Repository: owner/repo\nFix the failing test',
+        cwd: '/workspace/testbed',
+        observations: [
+          {
+            tool_name: 'read_file',
+            tool_input: { path: 'app.py' },
+            tool_response: 'contents',
+          },
+        ],
+        last_assistant_message: 'The failure is in app.py',
+      },
+    });
+
+    await handlers['POST /api/replay/materialize'](req as Request, res as Response);
+
+    expect(runIsolatedPrompts).toHaveBeenCalledTimes(2);
+    expect(completeByDbId).toHaveBeenCalledWith(7);
+    expect(jsonSpy).toHaveBeenCalledWith({
+      status: 'completed',
+      sessionDbId: 7,
+      observationCount: 0,
+      summaryCount: 1,
+      observationDelta: 0,
+      summaryDelta: 1,
+      materializationMode: 'summary_only',
+      warnings: ['zero_observations'],
       summaryStored: true,
     });
   });
