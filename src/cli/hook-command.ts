@@ -1,12 +1,62 @@
+import { resolve } from 'path';
 import { readJsonFromStdin } from './stdin-reader.js';
 import { getPlatformAdapter } from './adapters/index.js';
 import { getEventHandler } from './handlers/index.js';
 import { HOOK_EXIT_CODES } from '../shared/hook-constants.js';
+import { OBSERVER_SESSIONS_DIR } from '../shared/paths.js';
 import { logger } from '../utils/logger.js';
+import type { HookResult } from './types.js';
 
 export interface HookCommandOptions {
   /** If true, don't call process.exit() - let caller handle process lifecycle */
   skipExit?: boolean;
+}
+
+function normalizePathForComparison(path: string): string {
+  return resolve(path).replace(/\\/g, '/').replace(/\/+$/, '');
+}
+
+export function isObserverHookCwd(cwd: string | undefined): boolean {
+  if (!cwd) {
+    return false;
+  }
+
+  const normalizedObserverDir = normalizePathForComparison(OBSERVER_SESSIONS_DIR);
+  const normalizedCwd = normalizePathForComparison(cwd);
+  return (
+    normalizedCwd === normalizedObserverDir ||
+    normalizedCwd.startsWith(`${normalizedObserverDir}/`)
+  );
+}
+
+export function getObserverHookBypassResult(event: string): HookResult | null {
+  switch (event) {
+    case 'context':
+      return {
+        hookSpecificOutput: {
+          hookEventName: 'SessionStart',
+          additionalContext: ''
+        },
+        exitCode: HOOK_EXIT_CODES.SUCCESS
+      };
+    case 'user-message':
+      return {
+        exitCode: HOOK_EXIT_CODES.SUCCESS
+      };
+    case 'session-init':
+    case 'observation':
+    case 'summarize':
+    case 'session-complete':
+    case 'file-edit':
+    case 'file-context':
+      return {
+        continue: true,
+        suppressOutput: true,
+        exitCode: HOOK_EXIT_CODES.SUCCESS
+      };
+    default:
+      return null;
+  }
 }
 
 /**
@@ -79,6 +129,28 @@ export async function hookCommand(platform: string, event: string, options: Hook
     const rawInput = await readJsonFromStdin();
     const input = adapter.normalizeInput(rawInput);
     input.platform = platform;  // Inject platform for handler-level decisions
+
+    // Observer subprocesses should never re-enter the memory hook pipeline.
+    // Guard here instead of trying to isolate via CLAUDE_CONFIG_DIR, which
+    // risks breaking auth/runtime assumptions for spawned Claude processes.
+    const observerBypassResult = isObserverHookCwd(input.cwd)
+      ? getObserverHookBypassResult(event)
+      : null;
+    if (observerBypassResult) {
+      logger.debug('HOOK', 'Skipping hook execution for observer session', {
+        event,
+        platform,
+        cwd: input.cwd
+      });
+      const output = adapter.formatOutput(observerBypassResult);
+      console.log(JSON.stringify(output));
+      const exitCode = observerBypassResult.exitCode ?? HOOK_EXIT_CODES.SUCCESS;
+      if (!options.skipExit) {
+        process.exit(exitCode);
+      }
+      return exitCode;
+    }
+
     const result = await handler.execute(input);
     const output = adapter.formatOutput(result);
 

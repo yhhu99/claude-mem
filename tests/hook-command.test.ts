@@ -8,7 +8,13 @@
  * - Programming errors (TypeError, etc.) → false (code bug, blocking)
  */
 import { describe, it, expect } from 'bun:test';
-import { isWorkerUnavailableError } from '../src/cli/hook-command.js';
+import {
+  getObserverHookBypassResult,
+  isObserverHookCwd,
+  isWorkerUnavailableError
+} from '../src/cli/hook-command.js';
+import { HOOK_EXIT_CODES } from '../src/shared/hook-constants.js';
+import { OBSERVER_SESSIONS_DIR } from '../src/shared/paths.js';
 
 describe('isWorkerUnavailableError', () => {
   describe('transport failures → true (graceful)', () => {
@@ -159,6 +165,61 @@ describe('isWorkerUnavailableError', () => {
     it('should handle null/undefined errors', () => {
       expect(isWorkerUnavailableError(null)).toBe(false);
       expect(isWorkerUnavailableError(undefined)).toBe(false);
+    });
+  });
+});
+
+describe('observer hook guard helpers', () => {
+  describe('isObserverHookCwd', () => {
+    it('matches the observer sessions root directory', () => {
+      expect(isObserverHookCwd(OBSERVER_SESSIONS_DIR)).toBe(true);
+    });
+
+    it('matches descendant directories under the observer sessions root', () => {
+      expect(isObserverHookCwd(`${OBSERVER_SESSIONS_DIR}/nested/session`)).toBe(true);
+    });
+
+    it('does not match normal project directories', () => {
+      expect(isObserverHookCwd('/tmp/testbed')).toBe(false);
+    });
+
+    it('returns false for missing cwd', () => {
+      expect(isObserverHookCwd(undefined)).toBe(false);
+    });
+  });
+
+  describe('getObserverHookBypassResult', () => {
+    it('returns an empty SessionStart payload for context hooks', () => {
+      expect(getObserverHookBypassResult('context')).toEqual({
+        hookSpecificOutput: {
+          hookEventName: 'SessionStart',
+          additionalContext: ''
+        },
+        exitCode: HOOK_EXIT_CODES.SUCCESS
+      });
+    });
+
+    it('returns a standard no-op response for write-path hooks', () => {
+      expect(getObserverHookBypassResult('observation')).toEqual({
+        continue: true,
+        suppressOutput: true,
+        exitCode: HOOK_EXIT_CODES.SUCCESS
+      });
+      expect(getObserverHookBypassResult('summarize')).toEqual({
+        continue: true,
+        suppressOutput: true,
+        exitCode: HOOK_EXIT_CODES.SUCCESS
+      });
+    });
+
+    it('returns success-only result for user-message hooks', () => {
+      expect(getObserverHookBypassResult('user-message')).toEqual({
+        exitCode: HOOK_EXIT_CODES.SUCCESS
+      });
+    });
+
+    it('returns null for unrelated events', () => {
+      expect(getObserverHookBypassResult('unknown-event')).toBeNull();
     });
   });
 });
