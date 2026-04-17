@@ -455,16 +455,24 @@ export class DataRoutes extends BaseRouteHandler {
   /**
    * Process pending queue
    * POST /api/pending-queue/process
-   * Body: { sessionLimit?: number } - defaults to 10
-   * Starts SDK agents for sessions with pending messages
+   * Body: { sessionLimit?: number, contentSessionId?: string } - defaults to 10
+   * Starts SDK agents for sessions with pending messages, optionally scoped to a single content session
    */
   private handleProcessPendingQueue = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
     const sessionLimit = Math.min(
       Math.max(parseInt(req.body.sessionLimit, 10) || 10, 1),
       100 // Max 100 sessions at once
     );
+    const contentSessionId = typeof req.body.contentSessionId === 'string'
+      ? req.body.contentSessionId.trim()
+      : undefined;
 
-    const result = await this.workerService.processPendingQueues(sessionLimit);
+    if (req.body.contentSessionId !== undefined && !contentSessionId) {
+      this.badRequest(res, 'contentSessionId must be a non-empty string');
+      return;
+    }
+
+    const result = await this.workerService.processPendingQueues(sessionLimit, contentSessionId);
 
     res.json({
       success: true,

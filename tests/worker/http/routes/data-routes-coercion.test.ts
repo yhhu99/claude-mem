@@ -42,6 +42,7 @@ describe('DataRoutes Type Coercion', () => {
   let routes: DataRoutes;
   let mockGetObservationsByIds: ReturnType<typeof mock>;
   let mockGetSdkSessionsBySessionIds: ReturnType<typeof mock>;
+  let mockProcessPendingQueues: ReturnType<typeof mock>;
 
   beforeEach(() => {
     loggerSpies = [
@@ -54,6 +55,12 @@ describe('DataRoutes Type Coercion', () => {
 
     mockGetObservationsByIds = mock(() => [{ id: 1 }, { id: 2 }]);
     mockGetSdkSessionsBySessionIds = mock(() => [{ id: 'abc' }]);
+    mockProcessPendingQueues = mock(async () => ({
+      totalPendingSessions: 0,
+      sessionsStarted: 0,
+      sessionsSkipped: 0,
+      startedSessionIds: [],
+    }));
 
     const mockDbManager = {
       getSessionStore: () => ({
@@ -67,7 +74,9 @@ describe('DataRoutes Type Coercion', () => {
       mockDbManager as any,
       {} as any, // sessionManager
       {} as any, // sseBroadcaster
-      {} as any, // workerService
+      {
+        processPendingQueues: mockProcessPendingQueues,
+      } as any, // workerService
       Date.now()
     );
   });
@@ -189,6 +198,48 @@ describe('DataRoutes Type Coercion', () => {
       const { req, res, statusSpy } = createMockReqRes({ memorySessionIds: 42 });
       handler(req as Request, res as Response);
 
+      expect(statusSpy).toHaveBeenCalledWith(400);
+    });
+  });
+
+  describe('handleProcessPendingQueue — targeted replay processing', () => {
+    let handler: (req: Request, res: Response) => void;
+
+    beforeEach(() => {
+      const mockApp = {
+        get: mock(() => {}),
+        post: mock((path: string, fn: any) => {
+          if (path === '/api/pending-queue/process') handler = fn;
+        }),
+        delete: mock(() => {}),
+      };
+      routes.setupRoutes(mockApp as any);
+    });
+
+    it('should forward contentSessionId to workerService when provided', async () => {
+      const { req, res, jsonSpy } = createMockReqRes({
+        sessionLimit: 1,
+        contentSessionId: 'replay-session-1',
+      });
+
+      await handler(req as Request, res as Response);
+
+      expect(mockProcessPendingQueues).toHaveBeenCalledWith(1, 'replay-session-1');
+      expect(jsonSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: true,
+        }),
+      );
+    });
+
+    it('should reject blank contentSessionId values', async () => {
+      const { req, res, statusSpy } = createMockReqRes({
+        contentSessionId: '   ',
+      });
+
+      await handler(req as Request, res as Response);
+
+      expect(mockProcessPendingQueues).not.toHaveBeenCalled();
       expect(statusSpy).toHaveBeenCalledWith(400);
     });
   });

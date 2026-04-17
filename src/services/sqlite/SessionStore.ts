@@ -1511,6 +1511,69 @@ export class SessionStore {
   }
 
   /**
+   * Get session by content session ID
+   */
+  getSessionByContentSessionId(contentSessionId: string): {
+    id: number;
+    content_session_id: string;
+    memory_session_id: string | null;
+    project: string;
+    status: string;
+    started_at_epoch: number;
+  } | null {
+    const stmt = this.db.prepare(`
+      SELECT id, content_session_id, memory_session_id, project, status, started_at_epoch
+      FROM sdk_sessions
+      WHERE content_session_id = ?
+      LIMIT 1
+    `);
+
+    return stmt.get(contentSessionId) || null;
+  }
+
+  /**
+   * Count observations stored for a memory session
+   */
+  countObservationsByMemorySessionId(memorySessionId: string): number {
+    const stmt = this.db.prepare(`
+      SELECT COUNT(*) as count
+      FROM observations
+      WHERE memory_session_id = ?
+    `);
+
+    const row = stmt.get(memorySessionId) as { count: number } | undefined;
+    return row?.count ?? 0;
+  }
+
+  /**
+   * Count summaries stored for a memory session
+   */
+  countSummariesByMemorySessionId(memorySessionId: string): number {
+    const stmt = this.db.prepare(`
+      SELECT COUNT(*) as count
+      FROM session_summaries
+      WHERE memory_session_id = ?
+    `);
+
+    const row = stmt.get(memorySessionId) as { count: number } | undefined;
+    return row?.count ?? 0;
+  }
+
+  /**
+   * Check whether a summary has been stored for a specific prompt in a session
+   */
+  hasSummaryForPrompt(memorySessionId: string, promptNumber: number): boolean {
+    const stmt = this.db.prepare(`
+      SELECT 1
+      FROM session_summaries
+      WHERE memory_session_id = ? AND prompt_number = ?
+      LIMIT 1
+    `);
+
+    return !!stmt.get(memorySessionId, promptNumber);
+  }
+
+  /**
    * Get SDK sessions by SDK session IDs
    * Used for exporting session metadata
    */

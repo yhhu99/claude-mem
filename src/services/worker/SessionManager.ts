@@ -321,6 +321,9 @@ export class SessionManager {
     try {
       const messageId = this.getPendingStore().enqueue(sessionDbId, session.contentSessionId, message);
       const queueDepth = this.getPendingStore().getPendingCount(sessionDbId);
+      // A newly queued summarize request invalidates any prior success signal
+      // until this prompt either stores a summary or the processor marks it missing.
+      session.lastSummaryStored = false;
       logger.info('QUEUE', `ENQUEUED | sessionDbId=${sessionDbId} | messageId=${messageId} | type=summarize | depth=${queueDepth}`, {
         sessionId: sessionDbId
       });

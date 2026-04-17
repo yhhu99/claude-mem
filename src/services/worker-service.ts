@@ -864,7 +864,7 @@ export class WorkerService {
   /**
    * Process pending session queues
    */
-  async processPendingQueues(sessionLimit: number = 10): Promise<{
+  async processPendingQueues(sessionLimit: number = 10, targetContentSessionId?: string): Promise<{
     totalPendingSessions: number;
     sessionsStarted: number;
     sessionsSkipped: number;
@@ -913,19 +913,29 @@ export class WorkerService {
     }
 
     const orphanedSessionIds = pendingStore.getSessionsWithPendingMessages();
+    let candidateSessionIds = orphanedSessionIds;
+
+    if (targetContentSessionId) {
+      const targetSession = sessionStore.getSessionByContentSessionId(targetContentSessionId);
+      candidateSessionIds = targetSession && orphanedSessionIds.includes(targetSession.id)
+        ? [targetSession.id]
+        : [];
+    }
 
     const result = {
-      totalPendingSessions: orphanedSessionIds.length,
+      totalPendingSessions: candidateSessionIds.length,
       sessionsStarted: 0,
       sessionsSkipped: 0,
       startedSessionIds: [] as number[]
     };
 
-    if (orphanedSessionIds.length === 0) return result;
+    if (candidateSessionIds.length === 0) return result;
 
-    logger.info('SYSTEM', `Processing up to ${sessionLimit} of ${orphanedSessionIds.length} pending session queues`);
+    logger.info('SYSTEM', `Processing up to ${sessionLimit} of ${candidateSessionIds.length} pending session queues`, {
+      ...(targetContentSessionId && { targetContentSessionId })
+    });
 
-    for (const sessionDbId of orphanedSessionIds) {
+    for (const sessionDbId of candidateSessionIds) {
       if (result.sessionsStarted >= sessionLimit) break;
 
       try {

@@ -84,6 +84,71 @@ export class SessionRoutes extends BaseRouteHandler {
     return (isGeminiSelected() && isGeminiAvailable()) ? 'gemini' : 'claude';
   }
 
+  private shouldDeferProcessing(value: unknown): boolean {
+    return value === true;
+  }
+
+  private getReplayStatusSnapshot(contentSessionId: string): {
+    status: string;
+    activeInMemory: boolean;
+    sessionDbId: number | null;
+    project: string;
+    memorySessionId: string | null;
+    queueLength: number;
+    observationCount: number;
+    summaryCount: number;
+    summaryStored: boolean | null;
+    uptime: number | null;
+  } {
+    const store = this.dbManager.getSessionStore();
+    const persistedSession = store.getSessionByContentSessionId(contentSessionId);
+
+    if (!persistedSession) {
+      return {
+        status: 'not_found',
+        activeInMemory: false,
+        sessionDbId: null,
+        project: '',
+        memorySessionId: null,
+        queueLength: 0,
+        observationCount: 0,
+        summaryCount: 0,
+        summaryStored: null,
+        uptime: null,
+      };
+    }
+
+    const activeSession = this.sessionManager.getSession(persistedSession.id);
+    const pendingStore = this.sessionManager.getPendingMessageStore();
+    const queueLength = pendingStore.getPendingCount(persistedSession.id);
+    const observationCount = persistedSession.memory_session_id
+      ? store.countObservationsByMemorySessionId(persistedSession.memory_session_id)
+      : 0;
+    const summaryCount = persistedSession.memory_session_id
+      ? store.countSummariesByMemorySessionId(persistedSession.memory_session_id)
+      : 0;
+    const latestPromptNumber = store.getLatestUserPrompt(contentSessionId)?.prompt_number ?? null;
+    const persistedSummaryStored = (
+      persistedSession.memory_session_id
+      && latestPromptNumber !== null
+    )
+      ? store.hasSummaryForPrompt(persistedSession.memory_session_id, latestPromptNumber)
+      : false;
+
+    return {
+      status: persistedSession.status,
+      activeInMemory: !!activeSession,
+      sessionDbId: persistedSession.id,
+      project: persistedSession.project,
+      memorySessionId: persistedSession.memory_session_id,
+      queueLength,
+      observationCount,
+      summaryCount,
+      summaryStored: activeSession?.lastSummaryStored ?? persistedSummaryStored,
+      uptime: Date.now() - (activeSession?.startTime ?? persistedSession.started_at_epoch),
+    };
+  }
+
   /**
    * Ensures agent generator is running for a session
    * Auto-starts if not already running to process pending queue
@@ -456,6 +521,7 @@ export class SessionRoutes extends BaseRouteHandler {
     if (sessionDbId === null) return;
 
     const { tool_name, tool_input, tool_response, prompt_number, cwd } = req.body;
+    const deferProcessing = this.shouldDeferProcessing(req.body.deferProcessing);
 
     this.sessionManager.queueObservation(sessionDbId, {
       tool_name,
@@ -465,8 +531,10 @@ export class SessionRoutes extends BaseRouteHandler {
       cwd
     });
 
-    // CRITICAL: Ensure SDK agent is running to consume the queue
-    this.ensureGeneratorRunning(sessionDbId, 'observation');
+    if (!deferProcessing) {
+      // CRITICAL: Ensure SDK agent is running to consume the queue
+      this.ensureGeneratorRunning(sessionDbId, 'observation');
+    }
 
     // Broadcast observation queued event
     this.eventBroadcaster.broadcastObservationQueued(sessionDbId);
@@ -483,11 +551,14 @@ export class SessionRoutes extends BaseRouteHandler {
     if (sessionDbId === null) return;
 
     const { last_assistant_message } = req.body;
+    const deferProcessing = this.shouldDeferProcessing(req.body.deferProcessing);
 
     this.sessionManager.queueSummarize(sessionDbId, last_assistant_message);
 
-    // CRITICAL: Ensure SDK agent is running to consume the queue
-    this.ensureGeneratorRunning(sessionDbId, 'summarize');
+    if (!deferProcessing) {
+      // CRITICAL: Ensure SDK agent is running to consume the queue
+      this.ensureGeneratorRunning(sessionDbId, 'summarize');
+    }
 
     // Broadcast summarize queued event
     this.eventBroadcaster.broadcastSummarizeQueued();
@@ -556,6 +627,7 @@ export class SessionRoutes extends BaseRouteHandler {
     const { contentSessionId, tool_name, tool_input, tool_response, cwd } = req.body;
     const platformSource = normalizePlatformSource(req.body.platformSource);
     const project = typeof cwd === 'string' && cwd.trim() ? getProjectContext(cwd).primary : '';
+    const deferProcessing = this.shouldDeferProcessing(req.body.deferProcessing);
 
     if (!contentSessionId) {
       return this.badRequest(res, 'Missing contentSessionId');
@@ -631,8 +703,10 @@ export class SessionRoutes extends BaseRouteHandler {
         })()
       });
 
-      // Ensure SDK agent is running
-      this.ensureGeneratorRunning(sessionDbId, 'observation');
+      if (!deferProcessing) {
+        // Ensure SDK agent is running
+        this.ensureGeneratorRunning(sessionDbId, 'observation');
+      }
 
       // Broadcast observation queued event
       this.eventBroadcaster.broadcastObservationQueued(sessionDbId);
@@ -655,6 +729,7 @@ export class SessionRoutes extends BaseRouteHandler {
   private handleSummarizeByClaudeId = this.wrapHandler((req: Request, res: Response): void => {
     const { contentSessionId, last_assistant_message } = req.body;
     const platformSource = normalizePlatformSource(req.body.platformSource);
+    const deferProcessing = this.shouldDeferProcessing(req.body.deferProcessing);
 
     if (!contentSessionId) {
       return this.badRequest(res, 'Missing contentSessionId');
@@ -682,8 +757,10 @@ export class SessionRoutes extends BaseRouteHandler {
     // Queue summarize
     this.sessionManager.queueSummarize(sessionDbId, last_assistant_message);
 
-    // Ensure SDK agent is running
-    this.ensureGeneratorRunning(sessionDbId, 'summarize');
+    if (!deferProcessing) {
+      // Ensure SDK agent is running
+      this.ensureGeneratorRunning(sessionDbId, 'summarize');
+    }
 
     // Broadcast summarize queued event
     this.eventBroadcaster.broadcastSummarizeQueued();
@@ -704,27 +781,7 @@ export class SessionRoutes extends BaseRouteHandler {
       return this.badRequest(res, 'Missing contentSessionId query parameter');
     }
 
-    const store = this.dbManager.getSessionStore();
-    const sessionDbId = store.createSDKSession(contentSessionId, '', '');
-    const session = this.sessionManager.getSession(sessionDbId);
-
-    if (!session) {
-      res.json({ status: 'not_found', queueLength: 0 });
-      return;
-    }
-
-    const pendingStore = this.sessionManager.getPendingMessageStore();
-    const queueLength = pendingStore.getPendingCount(sessionDbId);
-
-    res.json({
-      status: 'active',
-      sessionDbId,
-      queueLength,
-      // Expose whether the last storage operation included a summary record.
-      // The Stop hook uses this to detect silent summary loss when the queue empties (#1633).
-      summaryStored: session.lastSummaryStored ?? null,
-      uptime: Date.now() - session.startTime
-    });
+    res.json(this.getReplayStatusSnapshot(contentSessionId));
   });
 
   /**
@@ -798,13 +855,15 @@ export class SessionRoutes extends BaseRouteHandler {
     const prompt = req.body.prompt || '[media prompt]';
     const platformSource = normalizePlatformSource(req.body.platformSource);
     const customTitle = req.body.customTitle || undefined;
+    const deferProcessing = this.shouldDeferProcessing(req.body.deferProcessing);
 
     logger.info('HTTP', 'SessionRoutes: handleSessionInitByClaudeId called', {
       contentSessionId,
       project,
       platformSource,
       prompt_length: prompt?.length,
-      customTitle
+      customTitle,
+      deferProcessing,
     });
 
     // Validate required parameters
@@ -860,7 +919,8 @@ export class SessionRoutes extends BaseRouteHandler {
     store.saveUserPrompt(contentSessionId, promptNumber, cleanedPrompt);
 
     // Step 6: Check if SDK agent is already running for this session (#1079)
-    // If contextInjected is true, the hook should skip re-initializing the SDK agent
+    // /api/sessions/init only prepares persistent state; live processing is still
+    // started by /sessions/:sessionDbId/init or an explicit pending-queue trigger.
     const contextInjected = this.sessionManager.getSession(sessionDbId) !== undefined;
 
     // Debug-level log since CREATED already logged the key info

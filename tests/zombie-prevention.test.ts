@@ -18,6 +18,7 @@ import { describe, test, expect, beforeEach, afterEach, mock } from 'bun:test';
 import { ClaudeMemDatabase } from '../src/services/sqlite/Database.js';
 import { PendingMessageStore } from '../src/services/sqlite/PendingMessageStore.js';
 import { createSDKSession } from '../src/services/sqlite/Sessions.js';
+import { WorkerService } from '../src/services/worker-service.js';
 import type { ActiveSession, PendingMessage } from '../src/services/worker-types.js';
 import type { Database } from 'bun:sqlite';
 
@@ -244,6 +245,63 @@ describe('Zombie Agent Prevention', () => {
     expect(sessionsWithPending).toContain(session2Id);
     expect(sessionsWithPending).not.toContain(session3Id);
     expect(sessionsWithPending.length).toBe(2);
+  });
+
+  test('should only start the targeted content session when replay processing is scoped', async () => {
+    const session1Id = createDbSession('content-target-1');
+    const session2Id = createDbSession('content-target-2');
+
+    enqueueTestMessage(session1Id, 'content-target-1');
+    enqueueTestMessage(session2Id, 'content-target-2');
+
+    const initializeSession = mock((sessionDbId: number) =>
+      createMockSession(sessionDbId, {
+        contentSessionId: sessionDbId === session1Id ? 'content-target-1' : 'content-target-2',
+      }),
+    );
+    const startSessionProcessor = mock(() => {});
+
+    const fakeSessionStore = {
+      db,
+      getSessionByContentSessionId(contentSessionId: string) {
+        return db.prepare(`
+          SELECT id, content_session_id, memory_session_id, project, status, started_at_epoch
+          FROM sdk_sessions
+          WHERE content_session_id = ?
+          LIMIT 1
+        `).get(contentSessionId) as {
+          id: number;
+          content_session_id: string;
+          memory_session_id: string | null;
+          project: string;
+          status: string;
+          started_at_epoch: number;
+        } | null;
+      },
+    };
+
+    const result = await WorkerService.prototype.processPendingQueues.call(
+      {
+        dbManager: {
+          getSessionStore: () => fakeSessionStore,
+        },
+        sessionManager: {
+          getSession: mock(() => undefined),
+          initializeSession,
+        },
+        startSessionProcessor,
+      },
+      10,
+      'content-target-2',
+    );
+
+    expect(result.totalPendingSessions).toBe(1);
+    expect(result.sessionsStarted).toBe(1);
+    expect(result.sessionsSkipped).toBe(0);
+    expect(result.startedSessionIds).toEqual([session2Id]);
+    expect(initializeSession).toHaveBeenCalledTimes(1);
+    expect(initializeSession).toHaveBeenCalledWith(session2Id);
+    expect(startSessionProcessor).toHaveBeenCalledTimes(1);
   });
 
   // Test: AbortController reset before restart
