@@ -29,7 +29,7 @@ import {
 } from './agents/index.js';
 
 // OpenRouter API endpoint
-const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const DEFAULT_OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
 // Context window management constants (defaults, overridable via settings)
 const DEFAULT_MAX_CONTEXT_MESSAGES = 20;  // Maximum messages to keep in conversation history
@@ -86,7 +86,7 @@ export class OpenRouterAgent {
   async startSession(session: ActiveSession, worker?: WorkerRef): Promise<void> {
     try {
       // Get OpenRouter configuration
-      const { apiKey, model, siteUrl, appName } = this.getOpenRouterConfig();
+      const { apiKey, model, baseUrl, siteUrl, appName } = this.getOpenRouterConfig();
 
       if (!apiKey) {
         throw new Error('OpenRouter API key not configured. Set CLAUDE_MEM_OPENROUTER_API_KEY in settings or OPENROUTER_API_KEY environment variable.');
@@ -110,7 +110,7 @@ export class OpenRouterAgent {
 
       // Add to conversation history and query OpenRouter with full context
       session.conversationHistory.push({ role: 'user', content: initPrompt });
-      const initResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, siteUrl, appName);
+      const initResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, baseUrl, siteUrl, appName);
 
       if (initResponse.content) {
         // Add response to conversation history
@@ -181,7 +181,7 @@ export class OpenRouterAgent {
 
           // Add to conversation history and query OpenRouter with full context
           session.conversationHistory.push({ role: 'user', content: obsPrompt });
-          const obsResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, siteUrl, appName);
+          const obsResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, baseUrl, siteUrl, appName);
 
           let tokensUsed = 0;
           if (obsResponse.content) {
@@ -224,7 +224,7 @@ export class OpenRouterAgent {
 
           // Add to conversation history and query OpenRouter with full context
           session.conversationHistory.push({ role: 'user', content: summaryPrompt });
-          const summaryResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, siteUrl, appName);
+          const summaryResponse = await this.queryOpenRouterMultiTurn(session.conversationHistory, apiKey, model, baseUrl, siteUrl, appName);
 
           let tokensUsed = 0;
           if (summaryResponse.content) {
@@ -294,7 +294,7 @@ export class OpenRouterAgent {
       return;
     }
 
-    const { apiKey, model, siteUrl, appName } = this.getOpenRouterConfig();
+    const { apiKey, model, baseUrl, siteUrl, appName } = this.getOpenRouterConfig();
 
     if (!apiKey) {
       throw new Error('OpenRouter API key not configured. Set CLAUDE_MEM_OPENROUTER_API_KEY in settings or OPENROUTER_API_KEY environment variable.');
@@ -311,7 +311,7 @@ export class OpenRouterAgent {
 
     for (const isolatedPrompt of prompts) {
       isolatedHistory.push({ role: 'user', content: isolatedPrompt.prompt });
-      const response = await this.queryOpenRouterMultiTurn(isolatedHistory, apiKey, model, siteUrl, appName);
+      const response = await this.queryOpenRouterMultiTurn(isolatedHistory, apiKey, model, baseUrl, siteUrl, appName);
       const responseContent = response.content || '';
 
       if (responseContent) {
@@ -407,6 +407,7 @@ export class OpenRouterAgent {
     history: ConversationMessage[],
     apiKey: string,
     model: string,
+    baseUrl: string,
     siteUrl?: string,
     appName?: string
   ): Promise<{ content: string; tokensUsed?: number }> {
@@ -416,20 +417,27 @@ export class OpenRouterAgent {
     const totalChars = truncatedHistory.reduce((sum, m) => sum + m.content.length, 0);
     const estimatedTokens = this.estimateTokens(truncatedHistory.map(m => m.content).join(''));
 
-    logger.debug('SDK', `Querying OpenRouter multi-turn (${model})`, {
+    logger.debug('SDK', `Querying OpenAI-compatible multi-turn (${model})`, {
+      baseUrl,
       turns: truncatedHistory.length,
       totalChars,
       estimatedTokens
     });
 
-    const response = await fetch(OPENROUTER_API_URL, {
+    const headers: Record<string, string> = {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    };
+    if (baseUrl.includes('openrouter.ai') || siteUrl) {
+      headers['HTTP-Referer'] = siteUrl || 'https://github.com/thedotmack/claude-mem';
+    }
+    if (baseUrl.includes('openrouter.ai') || appName) {
+      headers['X-Title'] = appName || 'claude-mem';
+    }
+
+    const response = await fetch(baseUrl, {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'HTTP-Referer': siteUrl || 'https://github.com/thedotmack/claude-mem',
-        'X-Title': appName || 'claude-mem',
-        'Content-Type': 'application/json',
-      },
+      headers,
       body: JSON.stringify({
         model,
         messages,
@@ -486,11 +494,20 @@ export class OpenRouterAgent {
     return { content, tokensUsed };
   }
 
+  private normalizeOpenRouterBaseUrl(value: string | undefined): string {
+    const trimmed = (value || DEFAULT_OPENROUTER_API_URL).trim();
+    const withoutTrailingSlash = trimmed.replace(/\/+$/, '');
+    if (withoutTrailingSlash.endsWith('/chat/completions')) {
+      return withoutTrailingSlash;
+    }
+    return `${withoutTrailingSlash}/chat/completions`;
+  }
+
   /**
    * Get OpenRouter configuration from settings or environment
    * Issue #733: Uses centralized ~/.claude-mem/.env for credentials, not random project .env files
    */
-  private getOpenRouterConfig(): { apiKey: string; model: string; siteUrl?: string; appName?: string } {
+  private getOpenRouterConfig(): { apiKey: string; model: string; baseUrl: string; siteUrl?: string; appName?: string } {
     const settingsPath = USER_SETTINGS_PATH;
     const settings = SettingsDefaultsManager.loadFromFile(settingsPath);
 
@@ -500,12 +517,13 @@ export class OpenRouterAgent {
 
     // Model: from settings or default
     const model = settings.CLAUDE_MEM_OPENROUTER_MODEL || 'xiaomi/mimo-v2-flash:free';
+    const baseUrl = this.normalizeOpenRouterBaseUrl(settings.CLAUDE_MEM_OPENROUTER_BASE_URL);
 
     // Optional analytics headers
     const siteUrl = settings.CLAUDE_MEM_OPENROUTER_SITE_URL || '';
     const appName = settings.CLAUDE_MEM_OPENROUTER_APP_NAME || 'claude-mem';
 
-    return { apiKey, model, siteUrl, appName };
+    return { apiKey, model, baseUrl, siteUrl, appName };
   }
 }
 

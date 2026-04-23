@@ -417,6 +417,17 @@ export function ContextSettingsModal({
                     />
                   </FormField>
                   <FormField
+                    label="Base URL"
+                    tooltip="OpenAI-compatible /v1 endpoint or full /chat/completions URL"
+                  >
+                    <input
+                      type="text"
+                      value={formState.CLAUDE_MEM_OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1/chat/completions'}
+                      onChange={(e) => updateSetting('CLAUDE_MEM_OPENROUTER_BASE_URL', e.target.value)}
+                      placeholder="https://api.example.com/v1"
+                    />
+                  </FormField>
+                  <FormField
                     label="OpenRouter Model"
                     tooltip="Model identifier from OpenRouter (e.g., anthropic/claude-3.5-sonnet, google/gemini-2.0-flash-thinking-exp)"
                   >
