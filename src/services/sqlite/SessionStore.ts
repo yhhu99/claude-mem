@@ -2527,6 +2527,7 @@ export class SessionStore {
    * Returns: { imported: boolean, id: number }
    */
   importSdkSession(session: {
+    id?: number;
     content_session_id: string;
     memory_session_id: string;
     project: string;
@@ -2537,24 +2538,35 @@ export class SessionStore {
     completed_at: string | null;
     completed_at_epoch: number | null;
     status: string;
-  }): { imported: boolean; id: number } {
+  }, options: { preserveId?: boolean } = {}): { imported: boolean; id: number } {
+    const requestedId = this.getPreservedImportId(session.id, options.preserveId, 'sdk_sessions');
     // Check if session already exists
     const existing = this.db.prepare(
       'SELECT id FROM sdk_sessions WHERE content_session_id = ?'
     ).get(session.content_session_id) as { id: number } | undefined;
 
     if (existing) {
+      if (requestedId !== null && existing.id !== requestedId) {
+        throw new Error(`Cannot preserve sdk_sessions id ${requestedId}: duplicate content_session_id already exists as id ${existing.id}`);
+      }
       return { imported: false, id: existing.id };
     }
 
-    const stmt = this.db.prepare(`
+    this.assertPreservedImportIdAvailable('sdk_sessions', requestedId);
+
+    const stmt = requestedId === null ? this.db.prepare(`
       INSERT INTO sdk_sessions (
         content_session_id, memory_session_id, project, platform_source, user_prompt,
         started_at, started_at_epoch, completed_at, completed_at_epoch, status
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `) : this.db.prepare(`
+      INSERT INTO sdk_sessions (
+        id, content_session_id, memory_session_id, project, platform_source, user_prompt,
+        started_at, started_at_epoch, completed_at, completed_at_epoch, status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
-    const result = stmt.run(
+    const values = [
       session.content_session_id,
       session.memory_session_id,
       session.project,
@@ -2565,7 +2577,8 @@ export class SessionStore {
       session.completed_at,
       session.completed_at_epoch,
       session.status
-    );
+    ];
+    const result = stmt.run(...(requestedId === null ? values : [requestedId, ...values]));
 
     return { imported: true, id: result.lastInsertRowid as number };
   }
@@ -2575,6 +2588,7 @@ export class SessionStore {
    * Returns: { imported: boolean, id: number }
    */
   importSessionSummary(summary: {
+    id?: number;
     memory_session_id: string;
     project: string;
     request: string | null;
@@ -2589,25 +2603,37 @@ export class SessionStore {
     discovery_tokens: number;
     created_at: string;
     created_at_epoch: number;
-  }): { imported: boolean; id: number } {
+  }, options: { preserveId?: boolean } = {}): { imported: boolean; id: number } {
+    const requestedId = this.getPreservedImportId(summary.id, options.preserveId, 'session_summaries');
     // Check if summary already exists for this session
     const existing = this.db.prepare(
       'SELECT id FROM session_summaries WHERE memory_session_id = ?'
     ).get(summary.memory_session_id) as { id: number } | undefined;
 
     if (existing) {
+      if (requestedId !== null && existing.id !== requestedId) {
+        throw new Error(`Cannot preserve session_summaries id ${requestedId}: duplicate memory_session_id already exists as id ${existing.id}`);
+      }
       return { imported: false, id: existing.id };
     }
 
-    const stmt = this.db.prepare(`
+    this.assertPreservedImportIdAvailable('session_summaries', requestedId);
+
+    const stmt = requestedId === null ? this.db.prepare(`
       INSERT INTO session_summaries (
         memory_session_id, project, request, investigated, learned,
         completed, next_steps, files_read, files_edited, notes,
         prompt_number, discovery_tokens, created_at, created_at_epoch
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `) : this.db.prepare(`
+      INSERT INTO session_summaries (
+        id, memory_session_id, project, request, investigated, learned,
+        completed, next_steps, files_read, files_edited, notes,
+        prompt_number, discovery_tokens, created_at, created_at_epoch
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
-    const result = stmt.run(
+    const values = [
       summary.memory_session_id,
       summary.project,
       summary.request,
@@ -2622,7 +2648,8 @@ export class SessionStore {
       summary.discovery_tokens || 0,
       summary.created_at,
       summary.created_at_epoch
-    );
+    ];
+    const result = stmt.run(...(requestedId === null ? values : [requestedId, ...values]));
 
     return { imported: true, id: result.lastInsertRowid as number };
   }
@@ -2633,6 +2660,7 @@ export class SessionStore {
    * Returns: { imported: boolean, id: number }
    */
   importObservation(obs: {
+    id?: number;
     memory_session_id: string;
     project: string;
     text: string | null;
@@ -2648,7 +2676,8 @@ export class SessionStore {
     discovery_tokens: number;
     created_at: string;
     created_at_epoch: number;
-  }): { imported: boolean; id: number } {
+  }, options: { preserveId?: boolean } = {}): { imported: boolean; id: number } {
+    const requestedId = this.getPreservedImportId(obs.id, options.preserveId, 'observations');
     // Check if observation already exists
     const existing = this.db.prepare(`
       SELECT id FROM observations
@@ -2656,18 +2685,29 @@ export class SessionStore {
     `).get(obs.memory_session_id, obs.title, obs.created_at_epoch) as { id: number } | undefined;
 
     if (existing) {
+      if (requestedId !== null && existing.id !== requestedId) {
+        throw new Error(`Cannot preserve observations id ${requestedId}: duplicate observation already exists as id ${existing.id}`);
+      }
       return { imported: false, id: existing.id };
     }
 
-    const stmt = this.db.prepare(`
+    this.assertPreservedImportIdAvailable('observations', requestedId);
+
+    const stmt = requestedId === null ? this.db.prepare(`
       INSERT INTO observations (
         memory_session_id, project, text, type, title, subtitle,
         facts, narrative, concepts, files_read, files_modified,
         prompt_number, discovery_tokens, created_at, created_at_epoch
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `) : this.db.prepare(`
+      INSERT INTO observations (
+        id, memory_session_id, project, text, type, title, subtitle,
+        facts, narrative, concepts, files_read, files_modified,
+        prompt_number, discovery_tokens, created_at, created_at_epoch
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
-    const result = stmt.run(
+    const values = [
       obs.memory_session_id,
       obs.project,
       obs.text,
@@ -2683,7 +2723,8 @@ export class SessionStore {
       obs.discovery_tokens || 0,
       obs.created_at,
       obs.created_at_epoch
-    );
+    ];
+    const result = stmt.run(...(requestedId === null ? values : [requestedId, ...values]));
 
     return { imported: true, id: result.lastInsertRowid as number };
   }
@@ -2711,12 +2752,14 @@ export class SessionStore {
    * Returns: { imported: boolean, id: number }
    */
   importUserPrompt(prompt: {
+    id?: number;
     content_session_id: string;
     prompt_number: number;
     prompt_text: string;
     created_at: string;
     created_at_epoch: number;
-  }): { imported: boolean; id: number } {
+  }, options: { preserveId?: boolean } = {}): { imported: boolean; id: number } {
+    const requestedId = this.getPreservedImportId(prompt.id, options.preserveId, 'user_prompts');
     // Check if prompt already exists
     const existing = this.db.prepare(`
       SELECT id FROM user_prompts
@@ -2724,24 +2767,55 @@ export class SessionStore {
     `).get(prompt.content_session_id, prompt.prompt_number) as { id: number } | undefined;
 
     if (existing) {
+      if (requestedId !== null && existing.id !== requestedId) {
+        throw new Error(`Cannot preserve user_prompts id ${requestedId}: duplicate prompt already exists as id ${existing.id}`);
+      }
       return { imported: false, id: existing.id };
     }
 
-    const stmt = this.db.prepare(`
+    this.assertPreservedImportIdAvailable('user_prompts', requestedId);
+
+    const stmt = requestedId === null ? this.db.prepare(`
       INSERT INTO user_prompts (
         content_session_id, prompt_number, prompt_text,
         created_at, created_at_epoch
       ) VALUES (?, ?, ?, ?, ?)
+    `) : this.db.prepare(`
+      INSERT INTO user_prompts (
+        id, content_session_id, prompt_number, prompt_text,
+        created_at, created_at_epoch
+      ) VALUES (?, ?, ?, ?, ?, ?)
     `);
 
-    const result = stmt.run(
+    const values = [
       prompt.content_session_id,
       prompt.prompt_number,
       prompt.prompt_text,
       prompt.created_at,
       prompt.created_at_epoch
-    );
+    ];
+    const result = stmt.run(...(requestedId === null ? values : [requestedId, ...values]));
 
     return { imported: true, id: result.lastInsertRowid as number };
+  }
+
+  private getPreservedImportId(id: unknown, preserveId: boolean | undefined, table: string): number | null {
+    if (!preserveId) {
+      return null;
+    }
+    if (!Number.isInteger(id) || (id as number) <= 0) {
+      throw new Error(`Cannot preserve ${table} id: export row is missing a positive integer id`);
+    }
+    return id as number;
+  }
+
+  private assertPreservedImportIdAvailable(table: string, id: number | null): void {
+    if (id === null) {
+      return;
+    }
+    const existing = this.db.prepare(`SELECT id FROM ${table} WHERE id = ?`).get(id) as { id: number } | undefined;
+    if (existing) {
+      throw new Error(`Cannot preserve ${table} id ${id}: id already exists`);
+    }
   }
 }

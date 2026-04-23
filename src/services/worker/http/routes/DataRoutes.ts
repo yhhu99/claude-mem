@@ -63,6 +63,7 @@ export class DataRoutes extends BaseRouteHandler {
 
     // Import endpoint
     app.post('/api/import', this.handleImport.bind(this));
+    app.post('/api/chroma/backfill', this.handleChromaBackfill.bind(this));
   }
 
   /**
@@ -343,6 +344,8 @@ export class DataRoutes extends BaseRouteHandler {
    */
   private handleImport = this.wrapHandler((req: Request, res: Response): void => {
     const { sessions, summaries, observations, prompts } = req.body;
+    const preserveIds = req.body.preserveIds === true;
+    const importOptions = { preserveId: preserveIds };
 
     const stats = {
       sessionsImported: 0,
@@ -360,7 +363,7 @@ export class DataRoutes extends BaseRouteHandler {
     // Import sessions first (dependency for everything else)
     if (Array.isArray(sessions)) {
       for (const session of sessions) {
-        const result = store.importSdkSession(session);
+        const result = store.importSdkSession(session, importOptions);
         if (result.imported) {
           stats.sessionsImported++;
         } else {
@@ -372,7 +375,7 @@ export class DataRoutes extends BaseRouteHandler {
     // Import summaries (depends on sessions)
     if (Array.isArray(summaries)) {
       for (const summary of summaries) {
-        const result = store.importSessionSummary(summary);
+        const result = store.importSessionSummary(summary, importOptions);
         if (result.imported) {
           stats.summariesImported++;
         } else {
@@ -384,7 +387,7 @@ export class DataRoutes extends BaseRouteHandler {
     // Import observations (depends on sessions)
     if (Array.isArray(observations)) {
       for (const obs of observations) {
-        const result = store.importObservation(obs);
+        const result = store.importObservation(obs, importOptions);
         if (result.imported) {
           stats.observationsImported++;
         } else {
@@ -403,7 +406,7 @@ export class DataRoutes extends BaseRouteHandler {
     // Import prompts (depends on sessions)
     if (Array.isArray(prompts)) {
       for (const prompt of prompts) {
-        const result = store.importUserPrompt(prompt);
+        const result = store.importUserPrompt(prompt, importOptions);
         if (result.imported) {
           stats.promptsImported++;
         } else {
@@ -414,7 +417,51 @@ export class DataRoutes extends BaseRouteHandler {
 
     res.json({
       success: true,
+      preserveIds,
       stats
+    });
+  });
+
+  /**
+   * Blocking Chroma backfill for snapshot build/import workflows.
+   * POST /api/chroma/backfill
+   * Body: { projects?: string[] }
+   */
+  private handleChromaBackfill = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
+    const chromaSync = this.dbManager.getChromaSync();
+    if (!chromaSync) {
+      res.status(409).json({
+        success: false,
+        error: 'Chroma is disabled. Set CLAUDE_MEM_CHROMA_ENABLED=true before starting the worker.',
+      });
+      return;
+    }
+
+    const requestedProjects: string[] = Array.isArray(req.body.projects)
+      ? req.body.projects
+          .filter(
+            (value: unknown): value is string =>
+              typeof value === 'string' && value.trim().length > 0
+          )
+          .map((value: string) => value.trim())
+      : [];
+
+    const projects = requestedProjects.length > 0
+      ? Array.from(new Set(requestedProjects))
+      : (this.dbManager.getSessionStore().db.prepare(
+          'SELECT DISTINCT project FROM observations WHERE project IS NOT NULL AND project != ?'
+        ).all('') as { project: string }[]).map(row => row.project);
+
+    const backfilledProjects: string[] = [];
+    for (const project of projects) {
+      await chromaSync.ensureBackfilled(project);
+      backfilledProjects.push(project);
+    }
+
+    res.json({
+      success: true,
+      projects: backfilledProjects,
+      count: backfilledProjects.length,
     });
   });
 

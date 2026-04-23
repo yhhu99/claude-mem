@@ -118,4 +118,100 @@ describe('SessionStore', () => {
     expect(stored).not.toBeNull();
     expect(stored?.created_at_epoch).toBe(pastTimestamp);
   });
+
+  it('should preserve imported row ids when requested', () => {
+    const session = store.importSdkSession({
+      id: 101,
+      content_session_id: 'import-content-1',
+      memory_session_id: 'import-memory-1',
+      project: 'testbed',
+      platform_source: 'claude',
+      user_prompt: 'Fix the issue',
+      started_at: '2026-04-23T00:00:00.000Z',
+      started_at_epoch: 1,
+      completed_at: null,
+      completed_at_epoch: null,
+      status: 'completed',
+    }, { preserveId: true });
+    expect(session.id).toBe(101);
+
+    const observation = store.importObservation({
+      id: 202,
+      memory_session_id: 'import-memory-1',
+      project: 'testbed',
+      text: null,
+      type: 'discovery',
+      title: 'Preserved observation',
+      subtitle: null,
+      facts: null,
+      narrative: 'Useful historical context',
+      concepts: null,
+      files_read: null,
+      files_modified: null,
+      prompt_number: 1,
+      discovery_tokens: 10,
+      created_at: '2026-04-23T00:00:01.000Z',
+      created_at_epoch: 2,
+    }, { preserveId: true });
+    expect(observation.id).toBe(202);
+
+    const summary = store.importSessionSummary({
+      id: 303,
+      memory_session_id: 'import-memory-1',
+      project: 'testbed',
+      request: 'Fix the issue',
+      investigated: null,
+      learned: null,
+      completed: null,
+      next_steps: null,
+      files_read: null,
+      files_edited: null,
+      notes: null,
+      prompt_number: 1,
+      discovery_tokens: 20,
+      created_at: '2026-04-23T00:00:02.000Z',
+      created_at_epoch: 3,
+    }, { preserveId: true });
+    expect(summary.id).toBe(303);
+
+    const prompt = store.importUserPrompt({
+      id: 404,
+      content_session_id: 'import-content-1',
+      prompt_number: 1,
+      prompt_text: 'Fix the issue',
+      created_at: '2026-04-23T00:00:03.000Z',
+      created_at_epoch: 4,
+    }, { preserveId: true });
+    expect(prompt.id).toBe(404);
+  });
+
+  it('should reject preserve id conflicts during import', () => {
+    store.importSdkSession({
+      id: 101,
+      content_session_id: 'import-content-1',
+      memory_session_id: 'import-memory-1',
+      project: 'testbed',
+      platform_source: 'claude',
+      user_prompt: 'Fix the issue',
+      started_at: '2026-04-23T00:00:00.000Z',
+      started_at_epoch: 1,
+      completed_at: null,
+      completed_at_epoch: null,
+      status: 'completed',
+    }, { preserveId: true });
+
+    expect(() => store.importSdkSession({
+      id: 102,
+      content_session_id: 'import-content-1',
+      memory_session_id: 'import-memory-1',
+      project: 'testbed',
+      platform_source: 'claude',
+      user_prompt: 'Fix the issue',
+      started_at: '2026-04-23T00:00:00.000Z',
+      started_at_epoch: 1,
+      completed_at: null,
+      completed_at_epoch: null,
+      status: 'completed',
+    }, { preserveId: true })).toThrow(/Cannot preserve sdk_sessions id 102/);
+  });
 });
